@@ -1,7 +1,7 @@
 import streamlit as st
 
 st.set_page_config(page_title="Origin Estimator", layout="centered")
-
+st.image("logo.png", width=180)
 st.title("Origin of Dreams Estimator")
 
 st.header("Project Details")
@@ -39,4 +39,5 @@ st.write(f"Subtotal: ${subtotal:,.2f}")
 st.write(f"Final Price (30% margin): ${price:,.2f}")
 
 if st.button("Generate Estimate"):
+
     st.success(f"Estimated Price: ${price:,.2f}")
