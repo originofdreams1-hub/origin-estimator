@@ -1,382 +1,483 @@
+import io
+import math
+from datetime import date, datetime
+
 import streamlit as st
 import pandas as pd
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+
 from PIL import Image
-import io
-from datetime import datetime
+from reportlab.lib.pagesizes import LETTER
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
 
-# =============================
-# COMPANY SETTINGS
-# =============================
-COMPANY_NAME = "Origin of Dreams Construction LLC"
-COMPANY_PHONE = "469-793-4345"
-COMPANY_EMAIL = "originofdreams1@gmail.com"
-DEFAULT_COMPANY_ADDRESS = "Lewisville, TX"
-LOGO_PATH = "logo.png"   # logo file must be in repo root
 
-# =============================
-# PAGE
-# =============================
-st.set_page_config(page_title="Origin Estimator", layout="wide")
+# ----------------------------
+# PAGE CONFIG
+# ----------------------------
+st.set_page_config(
+    page_title="Origin of Dreams Estimator",
+    page_icon="🧰",
+    layout="wide",
+)
 
-# =============================
+# ----------------------------
+# ONE-TIME STATE RESET (prevents widget/key conflicts after edits)
+# ----------------------------
+APP_VERSION = 3
+if st.session_state.get("app_version") != APP_VERSION:
+    st.session_state.clear()
+    st.session_state["app_version"] = APP_VERSION
+
+# ----------------------------
+# CONSTANTS (edit these)
+# ----------------------------
+DEFAULT_YOUR_ADDRESS = "Lewisville, TX"
+DEFAULT_LEAD_RATE = 75.0
+DEFAULT_HELPER_RATE = 30.0
+DEFAULT_MARGIN = 0.30
+
+LOGO_FILE = "logo.png"  # upload a file named EXACTLY logo.png to your repo (same folder as app.py)
+
+
+# ----------------------------
 # HELPERS
-# =============================
-def money(x):
+# ----------------------------
+def money(x: float) -> str:
     try:
-        return f"${float(x):,.2f}"
-    except:
+        return f"${x:,.2f}"
+    except Exception:
         return "$0.00"
 
-def safe_float(v):
+
+def safe_float(x, default=0.0) -> float:
     try:
-        return float(v)
-    except:
-        return 0.0
+        if x is None:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
 
-def calc_items(df):
-    df = df.copy()
-    for c in ["Qty", "Width", "Height", "Depth"]:
-        df[c] = df[c].apply(safe_float)
-    df["CubicIn"] = df["Qty"] * df["Width"] * df["Height"] * df["Depth"]
-    return df
 
-def create_pdf(data):
+def ensure_items_df():
+    if "items" not in st.session_state:
+        st.session_state["items"] = pd.DataFrame(
+            [
+                {
+                    "Qty": 1,
+                    "Item": "Example: Cabinet door replacement",
+                    "Width (in)": 0.0,
+                    "Height (in)": 0.0,
+                    "Depth (in)": 0.0,
+                    "Material $": 0.0,
+                    "Labor hrs": 0.0,
+                    "Notes": "",
+                }
+            ]
+        )
+
+
+def reset_current_estimate():
+    st.session_state["est_date"] = date.today()
+    st.session_state["project_name"] = ""
+    st.session_state["client_name"] = ""
+    st.session_state["client_address"] = ""
+    st.session_state["your_address"] = DEFAULT_YOUR_ADDRESS
+
+    st.session_state["lead_hours"] = 0.0
+    st.session_state["helper_hours"] = 0.0
+    st.session_state["lead_rate"] = DEFAULT_LEAD_RATE
+    st.session_state["helper_rate"] = DEFAULT_HELPER_RATE
+
+    st.session_state["materials_cost"] = 0.0
+    st.session_state["subcontract_cost"] = 0.0
+    st.session_state["misc_cost"] = 0.0
+
+    # travel options
+    st.session_state["travel_mode"] = "Manual travel cost"
+    st.session_state["roundtrip_miles"] = 0.0
+    st.session_state["mileage_rate"] = 0.75  # dollars per mile (edit if you want)
+    st.session_state["manual_travel_cost"] = 0.0
+
+    st.session_state["margin"] = DEFAULT_MARGIN
+
+    # items
+    ensure_items_df()
+
+
+def init_history():
+    if "history" not in st.session_state:
+        st.session_state["history"] = []
+
+
+def calc_items_totals(df: pd.DataFrame, lead_rate: float, helper_rate: float):
+    df2 = df.copy()
+    # make sure numeric
+    for col in ["Qty", "Width (in)", "Height (in)", "Depth (in)", "Material $", "Labor hrs"]:
+        if col in df2.columns:
+            df2[col] = pd.to_numeric(df2[col], errors="coerce").fillna(0.0)
+
+    df2["Qty"] = df2["Qty"].clip(lower=0)
+    df2["Line Material $"] = df2["Qty"] * df2["Material $"]
+    # labor hrs here are assumed LEAD hours (simple)
+    df2["Line Labor $"] = df2["Qty"] * df2["Labor hrs"] * lead_rate
+    df2["Line Total $"] = df2["Line Material $"] + df2["Line Labor $"]
+
+    items_material = float(df2["Line Material $"].sum())
+    items_labor = float(df2["Line Labor $"].sum())
+    items_total = float(df2["Line Total $"].sum())
+    return df2, items_material, items_labor, items_total
+
+
+def travel_cost(mode: str, miles: float, mileage_rate: float, manual: float) -> float:
+    if mode == "Mileage (round-trip miles × rate)":
+        return max(0.0, miles) * max(0.0, mileage_rate)
+    return max(0.0, manual)
+
+
+def make_pdf(estimate: dict) -> bytes:
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    W, H = letter
+    c = canvas.Canvas(buffer, pagesize=LETTER)
+    w, h = LETTER
 
-    left = 40
-    right = W - 40
-    y = H - 40
+    left = 0.75 * inch
+    top = h - 0.75 * inch
+    y = top
 
-    # Logo
+    # Logo (optional)
     try:
-        c.drawImage(LOGO_PATH, left, y - 80, width=90, preserveAspectRatio=True, mask="auto")
-    except:
-        pass
+        img = Image.open(LOGO_FILE)
+        # draw a bigger logo
+        logo_w = 1.6 * inch
+        aspect = img.height / img.width
+        logo_h = logo_w * aspect
+        c.drawImage(LOGO_FILE, left, y - logo_h, width=logo_w, height=logo_h, mask="auto")
+        x_title = left + logo_w + 0.35 * inch
+    except Exception:
+        x_title = left
 
-    # Company
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(left + 110, y - 10, COMPANY_NAME)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(x_title, y - 0.15 * inch, "Origin of Dreams Estimator")
     c.setFont("Helvetica", 10)
-    c.drawString(left + 110, y - 26, data.get("company_address",""))
-    c.drawString(left + 110, y - 40, COMPANY_PHONE)
-    c.drawString(left + 110, y - 54, COMPANY_EMAIL)
+    c.drawString(x_title, y - 0.45 * inch, f"Date: {estimate['date']}")
+    c.drawString(x_title, y - 0.65 * inch, f"Project: {estimate['project_name']}")
+    c.drawString(x_title, y - 0.85 * inch, f"Client: {estimate['client_name']}")
 
-    y -= 100
+    y -= 1.2 * inch
 
-    # Client
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(left, y, "Client")
-    y -= 14
+    c.drawString(left, y, "Addresses")
+    y -= 0.2 * inch
     c.setFont("Helvetica", 10)
-    c.drawString(left, y, data.get("client_name",""))
-    y -= 14
-    c.drawString(left, y, data.get("client_address",""))
+    c.drawString(left, y, f"Your address: {estimate['your_address']}")
+    y -= 0.2 * inch
+    c.drawString(left, y, f"Client address: {estimate['client_address']}")
+    y -= 0.35 * inch
 
-    y -= 25
-
-    # Project
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left, y, "Project")
-    y -= 14
-    c.setFont("Helvetica", 10)
-    c.drawString(left, y, data.get("project",""))
-    y -= 14
-    c.drawString(left, y, f"Date: {data.get('date','')}")
-    y -= 25
-
-    # Summary
     c.setFont("Helvetica-Bold", 11)
     c.drawString(left, y, "Summary")
-    y -= 14
+    y -= 0.25 * inch
     c.setFont("Helvetica", 10)
 
-    lines = [
-        ("Labor", data.get("labor",0.0)),
-        ("Materials", data.get("materials",0.0)),
-        ("Travel", data.get("travel",0.0)),
-        ("Subtotal", data.get("subtotal",0.0)),
-        ("Margin", data.get("margin_amt",0.0)),
-        ("Total", data.get("total",0.0)),
+    summary_lines = [
+        ("Items (material)", money(estimate["items_material"])),
+        ("Items (labor)", money(estimate["items_labor"])),
+        ("Labor (lead/helper)", money(estimate["labor_cost"])),
+        ("Materials (extra)", money(estimate["materials_cost"])),
+        ("Subcontract", money(estimate["subcontract_cost"])),
+        ("Misc", money(estimate["misc_cost"])),
+        ("Travel", money(estimate["travel_cost"])),
+        ("Subtotal", money(estimate["subtotal"])),
+        (f"Margin ({int(estimate['margin']*100)}%)", money(estimate["margin_amount"])),
+        ("Final Total", money(estimate["final_total"])),
     ]
-    for label, val in lines:
+
+    for label, val in summary_lines:
         c.drawString(left, y, f"{label}:")
-        c.drawRightString(right, y, money(val))
-        y -= 14
+        c.drawRightString(w - left, y, val)
+        y -= 0.2 * inch
 
-    y -= 10
-
-    # Items
+    y -= 0.2 * inch
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(left, y, "Items")
-    y -= 14
-
-    c.setFont("Helvetica-Bold", 9)
-    headers = ["Item", "Qty", "W", "H", "D", "Notes"]
-    xs = [left, left+210, left+240, left+270, left+300, left+330]
-    for i,h in enumerate(headers):
-        c.drawString(xs[i], y, h)
-    y -= 10
-
+    c.drawString(left, y, "Line Items")
+    y -= 0.25 * inch
     c.setFont("Helvetica", 9)
-    for r in data.get("items", []):
-        if y < 80:
+
+    # table header
+    headers = ["Qty", "Item", "W", "H", "D", "Mat $", "Hrs", "Line Total $"]
+    cols = [left, left + 0.5*inch, left + 3.4*inch, left + 3.85*inch, left + 4.3*inch, left + 4.75*inch, left + 5.55*inch, left + 6.1*inch]
+    for i, head in enumerate(headers):
+        c.drawString(cols[i], y, head)
+    y -= 0.18 * inch
+    c.line(left, y, w - left, y)
+    y -= 0.12 * inch
+
+    for row in estimate["items_rows"]:
+        if y < 1.1 * inch:
             c.showPage()
-            y = H - 40
-        c.drawString(xs[0], y, str(r.get("Item",""))[:30])
-        c.drawString(xs[1], y, str(r.get("Qty","")))
-        c.drawString(xs[2], y, str(r.get("Width","")))
-        c.drawString(xs[3], y, str(r.get("Height","")))
-        c.drawString(xs[4], y, str(r.get("Depth","")))
-        c.drawString(xs[5], y, str(r.get("Notes",""))[:40])
-        y -= 12
+            y = h - 0.75 * inch
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(left, y, "Line Items (continued)")
+            y -= 0.3 * inch
+            c.setFont("Helvetica", 9)
 
+        c.drawString(cols[0], y, str(int(row.get("Qty", 0))))
+        c.drawString(cols[1], y, str(row.get("Item", ""))[:40])
+        c.drawString(cols[2], y, f"{safe_float(row.get('Width (in)', 0)):g}")
+        c.drawString(cols[3], y, f"{safe_float(row.get('Height (in)', 0)):g}")
+        c.drawString(cols[4], y, f"{safe_float(row.get('Depth (in)', 0)):g}")
+        c.drawString(cols[5], y, money(safe_float(row.get("Material $", 0))))
+        c.drawString(cols[6], y, f"{safe_float(row.get('Labor hrs', 0)):g}")
+        c.drawRightString(w - left, y, money(safe_float(row.get("Line Total $", 0))))
+        y -= 0.18 * inch
+
+    y -= 0.25 * inch
+    c.setFont("Helvetica", 8)
+    c.drawString(left, y, "Note: This is a budgetary estimate. Final pricing may change after site verification / scope confirmation.")
+    c.showPage()
     c.save()
-    buffer.seek(0)
-    return buffer
 
-def default_items_df():
-    return pd.DataFrame([
-        {"Item":"Cabinet","Qty":1,"Width":48,"Height":34.5,"Depth":24,"Notes":""},
-        {"Item":"Door","Qty":2,"Width":18,"Height":30,"Depth":0.75,"Notes":"Shaker"},
-    ])
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
 
-# =============================
-# SESSION STATE INIT
-# =============================
-if "items" not in st.session_state:
-    st.session_state.items = default_items_df()
 
-if "history" not in st.session_state:
-    st.session_state.history = []  # list of saved estimates (dicts)
+# ----------------------------
+# INIT
+# ----------------------------
+init_history()
+if "project_name" not in st.session_state:
+    reset_current_estimate()
 
-# Input defaults stored in session keys so we can reset them
-defaults = {
-    "project": "",
-    "client": "",
-    "date": datetime.now().strftime("%Y-%m-%d"),
-    "client_addr": "",
-    "company_addr": DEFAULT_COMPANY_ADDRESS,
-    "lead_h": 0.0,
-    "lead_r": 85.0,
-    "help_h": 0.0,
-    "help_r": 45.0,
-    "mat": 0.0,
-    "miles": 0.0,
-    "rate": 0.75,
-    "margin_pct": 30,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+ensure_items_df()
 
-# =============================
-# HEADER
-# =============================
-col1, col2 = st.columns([1,3], vertical_alignment="center")
+# ----------------------------
+# HEADER (logo + title)
+# ----------------------------
+col_logo, col_title, col_btn = st.columns([1.2, 4.5, 1.3], vertical_alignment="center")
 
-with col1:
+with col_logo:
     try:
-        st.image(Image.open(LOGO_PATH), width=170)
-    except:
-        pass
+        st.image(LOGO_FILE, use_container_width=True)
+    except Exception:
+        st.warning("Upload your logo as **logo.png** to the repo (same folder as app.py).")
 
-with col2:
-    st.markdown("## Origin Estimator")
-    st.caption("Multi-item • Travel • Margin • PDF • Save History")
+with col_title:
+    st.title("Origin of Dreams Estimator")
+    st.caption("Build multi-line estimates, add travel, save history, and export to PDF.")
 
-st.divider()
-
-# =============================
-# LAYOUT
-# =============================
-left, right = st.columns([2,1], gap="large")
-
-with left:
-    st.subheader("Client / Project")
-
-    a,b,c = st.columns(3)
-    with a:
-        project = st.text_input("Project", key="project")
-    with b:
-        client = st.text_input("Client", key="client")
-    with c:
-        date = st.text_input("Date", key="date")
-
-    a,b = st.columns(2)
-    with a:
-        client_addr = st.text_input("Client address", key="client_addr")
-    with b:
-        company_addr = st.text_input("Your address", key="company_addr")
-
-    st.subheader("Items (add as many as you want)")
-    edited = st.data_editor(
-        st.session_state.items,
-        num_rows="dynamic",
-        use_container_width=True
-    )
-    st.session_state.items = edited
-
-    st.subheader("Labor / Materials / Travel")
-
-    a,b,c,d = st.columns(4)
-    with a:
-        lead_h = st.number_input("Lead hrs", min_value=0.0, max_value=1000.0, step=0.5, key="lead_h")
-    with b:
-        lead_r = st.number_input("Lead $/hr", min_value=0.0, max_value=500.0, step=1.0, key="lead_r")
-    with c:
-        help_h = st.number_input("Helper hrs", min_value=0.0, max_value=1000.0, step=0.5, key="help_h")
-    with d:
-        help_r = st.number_input("Helper $/hr", min_value=0.0, max_value=500.0, step=1.0, key="help_r")
-
-    a,b,c,d = st.columns(4)
-    with a:
-        mat = st.number_input("Materials $", min_value=0.0, max_value=100000.0, step=25.0, key="mat")
-    with b:
-        miles = st.number_input("Miles", min_value=0.0, max_value=2000.0, step=1.0, key="miles")
-    with c:
-        rate = st.number_input("$ per mile", min_value=0.0, max_value=10.0, step=0.05, key="rate")
-    with d:
-        margin_pct = st.slider("Margin %", min_value=0, max_value=60, value=int(st.session_state["margin_pct"]), step=1, key="margin_pct")
-
-# =============================
-# CALC
-# =============================
-margin = float(margin_pct) / 100.0
-travel = safe_float(miles) * safe_float(rate)
-labor = safe_float(lead_h) * safe_float(lead_r) + safe_float(help_h) * safe_float(help_r)
-subtotal = labor + safe_float(mat) + travel
-total = subtotal/(1-margin) if subtotal>0 and margin < 0.95 else 0.0
-margin_amt = total - subtotal if total > 0 else 0.0
-
-items_calc = calc_items(st.session_state.items)
-
-# =============================
-# RIGHT PANEL SUMMARY + BUTTONS
-# =============================
-with right:
-    st.subheader("Estimator (Top Summary)")
-
-    st.metric("Total", money(total))
-    st.metric("Subtotal", money(subtotal))
-
-    a,b = st.columns(2)
-    with a:
-        st.metric("Labor", money(labor))
-        st.metric("Travel", money(travel))
-    with b:
-        st.metric("Materials", money(mat))
-        st.metric("Margin", money(margin_amt))
-
-    st.divider()
-
-    st.caption("Items preview:")
-    st.dataframe(items_calc[["Item","Qty","Width","Height","Depth"]], height=200, use_container_width=True)
-
-    st.divider()
-
-    # ---- SAVE + NEW ESTIMATE BUTTONS
-    b1, b2 = st.columns(2)
-    with b1:
-        save_clicked = st.button("Save Estimate", use_container_width=True)
-    with b2:
-        new_clicked = st.button("New Estimate", use_container_width=True)
-
-    # Build current estimate payload (for PDF + Save)
-    estimate_payload = {
-        "date": date,
-        "project": project,
-        "client_name": client,
-        "client_address": client_addr,
-        "company_address": company_addr,
-        "labor": labor,
-        "materials": float(mat),
-        "travel": travel,
-        "subtotal": subtotal,
-        "margin_amt": margin_amt,
-        "total": total,
-        "margin_pct": margin_pct,
-        "lead_hours": float(lead_h),
-        "lead_rate": float(lead_r),
-        "helper_hours": float(help_h),
-        "helper_rate": float(help_r),
-        "miles": float(miles),
-        "rate_per_mile": float(rate),
-        "items": items_calc.to_dict("records"),
-    }
-
-    # Save estimate to session history
-    if save_clicked:
-        # minimal validation
-        if not project.strip():
-            st.warning("Add a Project name before saving.")
-        else:
-            st.session_state.history.append(estimate_payload)
-            st.success("Saved to History (this session). Download CSV to keep it permanently.")
-
-    # New estimate resets fields
-    if new_clicked:
-        # reset input keys
-        for k, v in defaults.items():
-            st.session_state[k] = v
-        # reset items
-        st.session_state.items = default_items_df()
+with col_btn:
+    if st.button("➕ New Estimate", use_container_width=True):
+        reset_current_estimate()
         st.rerun()
 
-    # ---- PDF Download
-    pdf = create_pdf(estimate_payload)
-    st.download_button(
-        "Download PDF",
-        data=pdf,
-        file_name=f"estimate_{(project.strip().replace(' ','_') or 'project')}.pdf",
-        mime="application/pdf",
-        use_container_width=True
-    )
-
-# =============================
-# HISTORY SECTION
-# =============================
 st.divider()
-st.subheader("Saved Estimates (History)")
 
-if len(st.session_state.history) == 0:
-    st.info("No saved estimates yet. Click **Save Estimate** to add one.")
-else:
-    # show compact table
-    hist_rows = []
-    for e in st.session_state.history:
-        hist_rows.append({
-            "Date": e.get("date",""),
-            "Client": e.get("client_name",""),
-            "Project": e.get("project",""),
-            "Total": e.get("total",0.0),
-            "Labor": e.get("labor",0.0),
-            "Materials": e.get("materials",0.0),
-            "Travel": e.get("travel",0.0),
-            "Margin %": e.get("margin_pct",0),
-        })
-    hist_df = pd.DataFrame(hist_rows)
-    # format money columns nicely in display
-    show_df = hist_df.copy()
-    for col in ["Total","Labor","Materials","Travel"]:
-        show_df[col] = show_df[col].apply(money)
+# ----------------------------
+# MAIN LAYOUT
+# ----------------------------
+left, right = st.columns([2.2, 1.1], gap="large")
 
-    st.dataframe(show_df, use_container_width=True)
+with left:
+    st.subheader("Project Details")
 
-    # download CSV (permanent)
-    csv_df = hist_df.copy()
-    csv_df["Total"] = csv_df["Total"].apply(safe_float)
-    csv_df["Labor"] = csv_df["Labor"].apply(safe_float)
-    csv_df["Materials"] = csv_df["Materials"].apply(safe_float)
-    csv_df["Travel"] = csv_df["Travel"].apply(safe_float)
+    a, b, c = st.columns(3)
+    with a:
+        st.session_state["est_date"] = st.date_input("Date", value=st.session_state["est_date"])
+    with b:
+        st.session_state["project_name"] = st.text_input("Project", value=st.session_state["project_name"])
+    with c:
+        st.session_state["client_name"] = st.text_input("Client", value=st.session_state["client_name"])
 
-    st.download_button(
-        "Download History CSV (Permanent)",
-        data=csv_df.to_csv(index=False).encode("utf-8"),
-        file_name="origin_estimate_history.csv",
-        mime="text/csv",
-        use_container_width=True
+    st.session_state["your_address"] = st.text_input("Your address", value=st.session_state["your_address"])
+    st.session_state["client_address"] = st.text_input("Client address", value=st.session_state["client_address"])
+
+    st.divider()
+    st.subheader("Items (add as many as you want)")
+
+    st.caption("Tip: Use Qty + dimensions for each line item. Labor hrs here are per item (lead hours).")
+
+    edited = st.data_editor(
+        st.session_state["items"],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="items_editor",
     )
+
+    # persist edits back to session
+    st.session_state["items"] = edited
+
+    st.divider()
+    st.subheader("Labor (overall)")
+
+    l1, l2, l3, l4 = st.columns(4)
+    with l1:
+        st.session_state["lead_hours"] = st.number_input("Lead hours", min_value=0.0, value=float(st.session_state["lead_hours"]), step=0.5)
+    with l2:
+        st.session_state["lead_rate"] = st.number_input("Lead rate ($/hr)", min_value=0.0, value=float(st.session_state["lead_rate"]), step=1.0)
+    with l3:
+        st.session_state["helper_hours"] = st.number_input("Helper hours", min_value=0.0, value=float(st.session_state["helper_hours"]), step=0.5)
+    with l4:
+        st.session_state["helper_rate"] = st.number_input("Helper rate ($/hr)", min_value=0.0, value=float(st.session_state["helper_rate"]), step=1.0)
+
+    st.divider()
+    st.subheader("Costs")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.session_state["materials_cost"] = st.number_input("Materials (extra) $", min_value=0.0, value=float(st.session_state["materials_cost"]), step=10.0)
+    with c2:
+        st.session_state["subcontract_cost"] = st.number_input("Subcontract $", min_value=0.0, value=float(st.session_state["subcontract_cost"]), step=10.0)
+    with c3:
+        st.session_state["misc_cost"] = st.number_input("Misc $", min_value=0.0, value=float(st.session_state["misc_cost"]), step=10.0)
+
+    st.divider()
+    st.subheader("Travel")
+
+    st.session_state["travel_mode"] = st.selectbox(
+        "How do you want to calculate travel?",
+        ["Manual travel cost", "Mileage (round-trip miles × rate)"],
+        index=0 if st.session_state["travel_mode"] == "Manual travel cost" else 1,
+    )
+
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.session_state["roundtrip_miles"] = st.number_input("Round-trip miles", min_value=0.0, value=float(st.session_state["roundtrip_miles"]), step=1.0)
+    with t2:
+        st.session_state["mileage_rate"] = st.number_input("Mileage rate ($/mile)", min_value=0.0, value=float(st.session_state["mileage_rate"]), step=0.05)
+    with t3:
+        st.session_state["manual_travel_cost"] = st.number_input("Manual travel cost $", min_value=0.0, value=float(st.session_state["manual_travel_cost"]), step=5.0)
+
+    st.divider()
+    st.subheader("Margin")
+
+    st.session_state["margin"] = st.slider("Margin", min_value=0.0, max_value=0.60, value=float(st.session_state["margin"]), step=0.01)
+
+
+with right:
+    st.subheader("Estimate Summary")
+
+    # compute totals
+    df_lines, items_material, items_labor, items_total = calc_items_totals(
+        st.session_state["items"],
+        lead_rate=float(st.session_state["lead_rate"]),
+        helper_rate=float(st.session_state["helper_rate"]),
+    )
+
+    labor_cost = (
+        float(st.session_state["lead_hours"]) * float(st.session_state["lead_rate"])
+        + float(st.session_state["helper_hours"]) * float(st.session_state["helper_rate"])
+    )
+
+    t_cost = travel_cost(
+        st.session_state["travel_mode"],
+        float(st.session_state["roundtrip_miles"]),
+        float(st.session_state["mileage_rate"]),
+        float(st.session_state["manual_travel_cost"]),
+    )
+
+    subtotal = (
+        items_total
+        + labor_cost
+        + float(st.session_state["materials_cost"])
+        + float(st.session_state["subcontract_cost"])
+        + float(st.session_state["misc_cost"])
+        + t_cost
+    )
+
+    margin = float(st.session_state["margin"])
+    margin_amount = subtotal * margin
+    final_total = subtotal + margin_amount
+
+    st.metric("Subtotal", money(subtotal))
+    st.metric(f"Margin ({int(margin*100)}%)", money(margin_amount))
+    st.metric("Final Total", money(final_total))
+
+    with st.expander("Breakdown", expanded=True):
+        st.write(f"**Items (material):** {money(items_material)}")
+        st.write(f"**Items (labor):** {money(items_labor)}")
+        st.write(f"**Labor (lead/helper):** {money(labor_cost)}")
+        st.write(f"**Materials (extra):** {money(float(st.session_state['materials_cost']))}")
+        st.write(f"**Subcontract:** {money(float(st.session_state['subcontract_cost']))}")
+        st.write(f"**Misc:** {money(float(st.session_state['misc_cost']))}")
+        st.write(f"**Travel:** {money(t_cost)}")
+
+    st.divider()
+
+    # build estimate dict for saving/pdf
+    estimate = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "date": str(st.session_state["est_date"]),
+        "project_name": st.session_state["project_name"],
+        "client_name": st.session_state["client_name"],
+        "your_address": st.session_state["your_address"],
+        "client_address": st.session_state["client_address"],
+        "items_rows": df_lines.to_dict(orient="records"),
+        "items_material": items_material,
+        "items_labor": items_labor,
+        "labor_cost": labor_cost,
+        "materials_cost": float(st.session_state["materials_cost"]),
+        "subcontract_cost": float(st.session_state["subcontract_cost"]),
+        "misc_cost": float(st.session_state["misc_cost"]),
+        "travel_cost": t_cost,
+        "subtotal": subtotal,
+        "margin": margin,
+        "margin_amount": margin_amount,
+        "final_total": final_total,
+    }
+
+    # Buttons
+    save_col, pdf_col = st.columns(2)
+
+    with save_col:
+        if st.button("💾 Save to History", use_container_width=True):
+            st.session_state["history"].insert(0, estimate)
+            st.success("Saved to history.")
+            st.rerun()
+
+    with pdf_col:
+        pdf_bytes = make_pdf(estimate)
+        st.download_button(
+            "📄 Download PDF",
+            data=pdf_bytes,
+            file_name=f"Estimate_{st.session_state['client_name'] or 'Client'}_{st.session_state['project_name'] or 'Project'}.pdf".replace(" ", "_"),
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("History")
+
+    if len(st.session_state["history"]) == 0:
+        st.caption("No saved estimates yet. Click **Save to History** to store one.")
+    else:
+        for i, e in enumerate(st.session_state["history"][:10]):  # show latest 10
+            title = f"{e['date']} — {e['client_name'] or 'Client'} — {e['project_name'] or 'Project'} — {money(e['final_total'])}"
+            with st.expander(title, expanded=False):
+                st.write(f"**Saved:** {e['timestamp']}")
+                st.write(f"**Your address:** {e['your_address']}")
+                st.write(f"**Client address:** {e['client_address']}")
+                st.write(f"**Final total:** {money(e['final_total'])}")
+
+                # quick load
+                if st.button(f"Load this estimate #{i+1}", key=f"load_{i}"):
+                    # load into current state
+                    st.session_state["est_date"] = datetime.strptime(e["date"], "%Y-%m-%d").date()
+                    st.session_state["project_name"] = e["project_name"]
+                    st.session_state["client_name"] = e["client_name"]
+                    st.session_state["your_address"] = e["your_address"]
+                    st.session_state["client_address"] = e["client_address"]
+
+                    st.session_state["materials_cost"] = e["materials_cost"]
+                    st.session_state["subcontract_cost"] = e["subcontract_cost"]
+                    st.session_state["misc_cost"] = e["misc_cost"]
+                    st.session_state["margin"] = e["margin"]
+
+                    # reset labor inputs (kept simple here)
+                    st.session_state["lead_hours"] = 0.0
+                    st.session_state["helper_hours"] = 0.0
+
+                    # restore items
+                    st.session_state["items"] = pd.DataFrame(e["items_rows"]).drop(columns=["Line Material $", "Line Labor $", "Line Total $"], errors="ignore")
+
+                    st.success("Loaded.")
+                    st.rerun()
